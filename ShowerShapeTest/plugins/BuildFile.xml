@@ -1,0 +1,5 @@
+<export>
+</export>
+<library   name="ShowerShapeTestShowerShapeTest_plugins" file="LocalEnergyMapProducer.cc">
+  <use   name="ShowerShapeTest/ShowerShapeTest"/>
+</library>
