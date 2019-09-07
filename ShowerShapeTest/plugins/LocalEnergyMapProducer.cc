@@ -17,6 +17,9 @@
 #include "DataFormats/EcalDetId/interface/EBDetId.h"
 #include "DataFormats/EcalDetId/interface/EEDetId.h"
 #include "DataFormats/Common/interface/View.h"
+#include "DataFormats/HepMCCandidate/interface/GenParticleFwd.h"
+#include "DataFormats/HepMCCandidate/interface/GenParticle.h"
+#include "DataFormats/Math/interface/deltaR.h"
 
 #include "TFile.h"
 #include "TH2D.h"
@@ -27,12 +30,17 @@ class LocalEnergyMapProducer : public edm::EDAnalyzer {
 
 private:
   bool fillFromEles_;
+  bool fillFromPhos_;
+  bool fillFromSCs_;
+  bool genMatch_;
 
   edm::EDGetTokenT<edm::View<reco::GsfElectron> > elesToken_;
   edm::EDGetTokenT<edm::View<reco::Photon> > phosToken_;
+  edm::EDGetTokenT<std::vector<reco::SuperCluster> > ebSCsToken_;
+  std::vector<edm::EDGetTokenT<reco::SuperClusterCollection>> scTokens_;
   edm::EDGetTokenT<EcalRecHitCollection> ebRecHitsToken_;
   edm::EDGetTokenT<EcalRecHitCollection> eeRecHitsToken_;
-
+  edm::EDGetTokenT<reco::GenParticleCollection> genPartsToken_;
   int nrBarrel_;
   int nrEndcap_;
   TH2* energyMapBarrel_;
@@ -55,6 +63,12 @@ private:
   void setToken(edm::EDGetTokenT<T>& token,const edm::ParameterSet& iPara,const std::string& tagName){
     token = consumes<T>(iPara.getParameter<edm::InputTag>(tagName));
   }
+  template<typename T>
+  void setToken(std::vector<edm::EDGetTokenT<T> > & tokens,const edm::ParameterSet& iPara,const std::string& tagName){
+    for(auto& tag: iPara.getParameter<std::vector<edm::InputTag> >(tagName)){
+      tokens.push_back(consumes<T>(tag));
+    }
+  }
   void fillLocalEnergyMap(DetId seedId,const EcalRecHitCollection& ebHits,const EcalRecHitCollection& eeHits);
   void fillLocalEnergyMapBarrel(EBDetId seedId,const EcalRecHitCollection& hits);
   void fillLocalEnergyMapEndcap(EEDetId seedId,const EcalRecHitCollection& hits);
@@ -62,19 +76,25 @@ private:
   static float getEnergy(DetId hitId,const EcalRecHitCollection& hits);
   template<typename DetIdType>
   static float calE5x5(DetIdType seedId,const EcalRecHitCollection& hits);
-
+  static std::vector<const reco::GenParticle*> filterGenParts(edm::Handle<reco::GenParticleCollection> genParts,const std::vector<int>& allowedPIDs);
+  static bool isBestGenPartMatch(const reco::SuperCluster& sc,const std::vector<const reco::GenParticle*> genParts,const std::vector<edm::Handle<reco::SuperClusterCollection> >& scHandles);
 };
 
 
 
 LocalEnergyMapProducer::LocalEnergyMapProducer(const edm::ParameterSet& iPara):
   fillFromEles_(iPara.getParameter<bool>("fillFromEles")),
+  fillFromPhos_(iPara.getParameter<bool>("fillFromPhos")),
+  fillFromSCs_(iPara.getParameter<bool>("fillFromSCs")),
+  genMatch_(iPara.getParameter<bool>("genMatch")),
   nrBarrel_(0),nrEndcap_(0)
 {
   setToken(elesToken_,iPara,"elesTag");
   setToken(phosToken_,iPara,"phosTag");
+  setToken(scTokens_,iPara,"scTags");
   setToken(ebRecHitsToken_,iPara,"ebRecHitsTag");
-  setToken(eeRecHitsToken_,iPara,"eeRecHitsTag");  
+  setToken(eeRecHitsToken_,iPara,"eeRecHitsTag"); 
+  setToken(genPartsToken_,iPara,"genPartsTag");
 }
 
 LocalEnergyMapProducer::~LocalEnergyMapProducer()
@@ -106,6 +126,17 @@ namespace {
     iEvent.getByToken(token,handle);
     return handle;
   }
+  template<typename T> 
+  std::vector<edm::Handle<T> > getHandle(const edm::Event& iEvent,const std::vector<edm::EDGetTokenT<T> >& tokens)
+  {
+    std::vector<edm::Handle<T> > handles;
+    for(auto& token : tokens){
+      edm::Handle<T> handle;
+      iEvent.getByToken(token,handle);
+      handles.emplace_back(std::move(handle));
+    }
+    return handles;
+  }
 }
 
 
@@ -115,21 +146,32 @@ void LocalEnergyMapProducer::analyze(const edm::Event& iEvent,const edm::EventSe
   auto phosHandle = getHandle(iEvent,phosToken_);
   auto ebRecHitsHandle = getHandle(iEvent,ebRecHitsToken_);
   auto eeRecHitsHandle = getHandle(iEvent,eeRecHitsToken_);
+  auto scHandles = getHandle(iEvent,scTokens_);
+  auto genParts = getHandle(iEvent,genPartsToken_);
+
+  std::vector<const reco::GenParticle*> monoPoles = filterGenParts(genParts,{-4110000,4110000});
 
   if(fillFromEles_){
     for(const reco::GsfElectron& ele : *elesHandle){
-      //put some selection on the electron
       fillLocalEnergyMap(ele.superCluster()->seed()->seed(),
 			 *ebRecHitsHandle,*eeRecHitsHandle);
     }
-  }else{
+  }else if(fillFromPhos_){
     for(const reco::Photon& pho : *phosHandle){
       //put some selection on the photon
       fillLocalEnergyMap(pho.superCluster()->seed()->seed(),
 			 *ebRecHitsHandle,*eeRecHitsHandle);
     }
+  }else if(fillFromSCs_){
+    for(auto& scHandle : scHandles){
+      for(const reco::SuperCluster& sc : *scHandle){
+	std::cout <<" sc filling "<<std::endl;
+	if(!genMatch_ || isBestGenPartMatch(sc,monoPoles,scHandles)){
+	  fillLocalEnergyMap(sc.seed()->seed(),*ebRecHitsHandle,*eeRecHitsHandle);
+	}
+      }
+    }
   }
-  
 }
 		
 
@@ -172,6 +214,35 @@ float LocalEnergyMapProducer::calE5x5(DetIdType seedId,const EcalRecHitCollectio
   return e5x5;
 }
 
+
+bool LocalEnergyMapProducer::isBestGenPartMatch(const reco::SuperCluster& sc,const std::vector<const reco::GenParticle*> genParts,const std::vector<edm::Handle<reco::SuperClusterCollection> >& scHandles)
+{
+  float maxDR2 = 0.2*0.2;
+  const reco::GenParticle* bestGenMatch = nullptr;
+  for(auto& genPart : genParts){
+    float dR2 = reco::deltaR2(sc.eta(),sc.phi(),genPart->eta(),genPart->phi());
+    if(dR2<maxDR2){
+      bestGenMatch = genPart;
+      maxDR2 = dR2;
+    }
+  }
+  
+  if(bestGenMatch){
+    for(auto& scHandle : scHandles){
+      for(auto& otherSC : *scHandle){
+	if(&otherSC != &sc){
+	  float dR2 = reco::deltaR2(otherSC.eta(),otherSC.phi(),bestGenMatch->eta(),bestGenMatch->phi());
+	  if(dR2<maxDR2) return false; //other SC matches better
+	}
+      }
+    }
+    return true; //match found and no better match found
+  }else{
+    return false; //no match found
+  }
+}
+
+
 void LocalEnergyMapProducer::fillLocalEnergyMapBarrel(EBDetId seedId,const EcalRecHitCollection& hits)
 {
   float e5x5 = calE5x5(seedId,hits); 
@@ -202,6 +273,17 @@ void LocalEnergyMapProducer::fillLocalEnergyMapEndcap(EEDetId seedId,const EcalR
       energyMapEndcap_->Fill(iXNr,iYNr,energy/e5x5);
     }
   }
+}
+std::vector<const reco::GenParticle*> LocalEnergyMapProducer::filterGenParts(edm::Handle<reco::GenParticleCollection> genParts,const std::vector<int>& allowedPIDs)
+{
+  std::vector<const reco::GenParticle*> filteredParts;
+  for(auto& genPart: * genParts){
+    if(genPart.isPromptFinalState() && 
+       std::find(allowedPIDs.begin(),allowedPIDs.end(),genPart.pdgId())!=allowedPIDs.end()){
+      filteredParts.push_back(&genPart);
+    }
+  }
+  return filteredParts;
 }
 
 
